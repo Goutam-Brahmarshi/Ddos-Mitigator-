@@ -35,7 +35,7 @@ import ipaddress
 from datetime import datetime
 from collections import defaultdict, deque
 
-# ── Dependency checks ──────────────────────────────────────
+# ── Dependency checks from scappy──────────────────────────────────────
 try:
     from scapy.all import sniff, IP, TCP, UDP, ICMP, get_if_list
 except ImportError:
@@ -44,7 +44,7 @@ except ImportError:
 
 try:
     import iptc
-except ImportError:
+except ImportError:f
     print("[!] python-iptables not found. Install with: sudo pip3 install python-iptables")
     sys.exit(1)
 
