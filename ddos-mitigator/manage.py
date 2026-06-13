@@ -1,33 +1,99 @@
 #!/usr/bin/env python3
 """
-=============================================================
-  DDoS Mitigator — Management CLI  v2
-  EDUCATIONAL USE ONLY
-=============================================================
-  Commands:
-    status              Show all currently blocked IPs and alert counts
-    unblock <ip>        Remove iptables block for a specific IP
-    flush               Remove ALL rules from the DDOS_MITIGATOR chain
-    log                 Tail the IDS/IPS log in real time
-    whitelist           Print the current whitelist from the config
-    help                Show this help message
-=============================================================
+manage.py — DDoS Mitigator Management CLI  v2
+EDUCATIONAL USE ONLY
+
+Commands:
+  status              Show all currently blocked IPs
+  unblock <ip>        Remove iptables block for an IP
+  flush               Remove ALL rules and chains
+  log                 Tail the log in real time
+  whitelist           Print current whitelist
+  help                Show this help message
 """
 
 import sys
 import os
 import subprocess
 import ipaddress
+import re as _re
+
+# ──────────────────────────────────────────────────────────
+#  TERMINAL UI  — shared with ddos_mitigator.py
+# ──────────────────────────────────────────────────────────
+
+class C:
+    RED     = '\033[91m'
+    ORANGE  = '\033[38;5;208m'
+    YELLOW  = '\033[93m'
+    GREEN   = '\033[92m'
+    CYAN    = '\033[96m'
+    BLUE    = '\033[94m'
+    MAGENTA = '\033[95m'
+    WHITE   = '\033[97m'
+    GREY    = '\033[90m'
+    BOLD    = '\033[1m'
+    DIM     = '\033[2m'
+    RESET   = '\033[0m'
+
+UI_W = 70
+
+def _strip(s: str) -> str:
+    return _re.sub(r'\033\[[^m]*m', '', s)
+
+def _box_top(title: str = "", w: int = UI_W) -> str:
+    if title:
+        pad   = w - len(title) - 4
+        left  = max(1, pad // 2)
+        right = max(1, pad - left)
+        return f"{C.GREY}╔{'═'*left} {C.WHITE}{C.BOLD}{title}{C.RESET}{C.GREY} {'═'*right}╗{C.RESET}"
+    return f"{C.GREY}╔{'═'*(w-2)}╗{C.RESET}"
+
+def _box_bot(w: int = UI_W) -> str:
+    return f"{C.GREY}╚{'═'*(w-2)}╝{C.RESET}"
+
+def _box_sep(w: int = UI_W) -> str:
+    return f"{C.GREY}╠{'═'*(w-2)}╣{C.RESET}"
+
+def _box_row(content: str, w: int = UI_W) -> str:
+    pad = w - 2 - len(_strip(content))
+    return f"{C.GREY}║{C.RESET} {content}{' '*max(0, pad-1)}{C.GREY}║{C.RESET}"
+
+def _box_blank(w: int = UI_W) -> str:
+    return f"{C.GREY}║{' '*(w-2)}║{C.RESET}"
+
+def _ok(msg: str) -> None:
+    print(f"  {C.GREEN}✔{C.RESET}  {msg}")
+
+def _warn(msg: str) -> None:
+    print(f"  {C.YELLOW}⚠{C.RESET}  {msg}")
+
+def _err(msg: str) -> None:
+    print(f"  {C.RED}✘{C.RESET}  {msg}")
+
+def print_manage_banner() -> None:
+    print()
+    print(_box_top("DDoS MITIGATOR  ·  MANAGE  v2"))
+    print(_box_row(f"  {C.GREY}Use: {C.WHITE}sudo python3 manage.py <command>{C.RESET}"))
+    print(_box_row(f"  {C.GREY}Commands: status  unblock  flush  log  whitelist  help{C.RESET}"))
+    print(_box_bot())
+    print()
+
+# ──────────────────────────────────────────────────────────
+#  DEPENDENCIES
+# ──────────────────────────────────────────────────────────
 
 try:
     import iptc
 except ImportError:
-    print("[!] python-iptables not found. Install with: sudo pip3 install python-iptables")
+    print(_box_top("MISSING DEPENDENCY"))
+    _err("python-iptables not found.")
+    print(f"     Install: {C.WHITE}sudo pip3 install python-iptables{C.RESET}")
+    print(_box_bot())
     sys.exit(1)
 
 CHAIN_NAME = "DDOS_MITIGATOR"
 LOG_FILE   = "/var/log/ddos_mitigator.log"
-
 
 # ──────────────────────────────────────────────────────────
 #  HELPERS
@@ -35,35 +101,35 @@ LOG_FILE   = "/var/log/ddos_mitigator.log"
 
 def check_root() -> None:
     if os.geteuid() != 0:
-        print("[!] Requires root. Run: sudo python3 manage.py <command>")
+        print()
+        print(_box_top("PERMISSION ERROR"))
+        _err(f"Root required.  Run: {C.WHITE}sudo python3 manage.py <command>{C.RESET}")
+        print(_box_bot())
         sys.exit(1)
-
 
 def chain_exists(table: iptc.Table) -> bool:
     return CHAIN_NAME in [c.name for c in table.chains]
 
-
 def validate_ip(ip: str) -> bool:
-    """Return True if ip is a valid IPv4 or IPv6 address."""
     try:
         ipaddress.ip_address(ip)
         return True
     except ValueError:
         return False
 
-
 # ──────────────────────────────────────────────────────────
 #  COMMANDS
 # ──────────────────────────────────────────────────────────
 
 def cmd_status() -> None:
-    print(f"\n{'═'*55}")
-    print(f"  iptables chain : {CHAIN_NAME}")
-    print(f"{'═'*55}")
+    import time
+    print()
+    print(_box_top(f"STATUS  ·  {CHAIN_NAME}"))
     try:
         table = iptc.Table(iptc.Table.FILTER)
         if not chain_exists(table):
-            print("  Chain does not exist — mitigator may not be running.")
+            _warn("Chain does not exist — mitigator may not be running.")
+            print(_box_bot())
             print()
             return
 
@@ -71,151 +137,182 @@ def cmd_status() -> None:
         rules = chain.rules
 
         if not rules:
-            print("  ✅  No IPs are currently blocked.")
+            print(_box_row(f"  {C.GREEN}No IPs are currently blocked.  ✔{C.RESET}"))
         else:
-            print(f"  {'#':<4} {'Source IP':<22} {'Action'}")
-            print(f"  {'-'*40}")
+            print(_box_row(f"  {C.BOLD}{'#':<4} {'Source IP':<24} Action{C.RESET}"))
+            print(_box_row(f"  {C.GREY}{'─'*4} {'─'*24} {'─'*8}{C.RESET}"))
             for idx, rule in enumerate(rules, 1):
-                # Strip the /prefix that iptc appends for display clarity
                 src    = (rule.src or "any").split("/")[0]
                 target = rule.target.name if rule.target else "?"
-                print(f"  {idx:<4} {src:<22} {target}")
-        print()
+                tcolor = C.RED if target == "DROP" else C.YELLOW
+                print(_box_row(f"  {C.GREY}{idx:<4}{C.RESET} {C.RED}{src:<24}{C.RESET} {tcolor}{target}{C.RESET}"))
 
-        # Also check if the jump rule is in INPUT
-        input_chain = iptc.Chain(table, "INPUT")
-        jump_present = any(
-            r.target and r.target.name == CHAIN_NAME
-            for r in input_chain.rules
-        )
-        if not jump_present:
-            print("  ⚠️  WARNING: No jump rule found in INPUT chain.")
-            print("      Restart the mitigator to re-insert it.\n")
+        print(_box_sep())
+        input_chain  = iptc.Chain(table, "INPUT")
+        jump_present = any(r.target and r.target.name == CHAIN_NAME for r in input_chain.rules)
+        if jump_present:
+            print(_box_row(f"  {C.GREEN}INPUT → {CHAIN_NAME} jump  ✔{C.RESET}"))
+        else:
+            print(_box_row(f"  {C.YELLOW}⚠  No jump rule in INPUT chain — restart mitigator.{C.RESET}"))
 
     except Exception as e:
-        print(f"[!] Error reading iptables: {e}")
-    print()
+        _err(f"Error reading iptables: {e}")
 
+    print(_box_bot())
+    print()
 
 def cmd_unblock(ip: str) -> None:
     if not validate_ip(ip):
-        print(f"[!] '{ip}' is not a valid IP address.")
+        print()
+        print(_box_top("UNBLOCK"))
+        _err(f"'{ip}' is not a valid IP address.")
+        print(_box_bot())
         sys.exit(1)
 
+    print()
+    print(_box_top(f"UNBLOCK  ·  {ip}"))
     try:
         table = iptc.Table(iptc.Table.FILTER)
         if not chain_exists(table):
-            print(f"[!] Chain {CHAIN_NAME} does not exist — nothing to unblock.")
+            _warn(f"Chain {CHAIN_NAME} does not exist — nothing to unblock.")
+            print(_box_bot())
             return
 
         chain   = iptc.Chain(table, CHAIN_NAME)
         removed = False
-
         for rule in list(chain.rules):
             rule_src = (rule.src or "").split("/")[0]
             if rule_src == ip:
                 chain.delete_rule(rule)
-                print(f"[+] Unblocked: {ip}")
+                _ok(f"Unblocked: {C.WHITE}{ip}{C.RESET}")
                 removed = True
 
         if not removed:
-            print(f"[!] No rule found for IP: {ip}")
+            _warn(f"No rule found for IP: {C.WHITE}{ip}{C.RESET}")
 
     except Exception as e:
-        print(f"[!] Error: {e}")
+        _err(f"Error: {e}")
 
+    print(_box_bot())
+    print()
 
 def cmd_flush() -> None:
-    print(f"  This will remove ALL rules from chain '{CHAIN_NAME}'")
-    print(f"  and the jump from the INPUT chain.")
-    confirm = input("[?] Are you sure? (yes/no): ")
+    print()
+    print(_box_top("FLUSH  ·  ALL RULES"))
+    print(_box_row(f"  {C.YELLOW}This removes ALL rules from chain '{CHAIN_NAME}'{C.RESET}"))
+    print(_box_row(f"  {C.YELLOW}and the jump from the INPUT chain.{C.RESET}"))
+    print(_box_bot())
+    confirm = input(f"\n  {C.BOLD}[?] Are you sure? (yes / no): {C.RESET}")
     if confirm.strip().lower() != "yes":
-        print("Aborted.")
+        print(f"\n  {C.GREY}Aborted.{C.RESET}\n")
         return
 
+    print()
+    print(_box_top("FLUSHING"))
     try:
-        table = iptc.Table(iptc.Table.FILTER)
-
-        # Remove jump from INPUT
-        input_chain  = iptc.Chain(table, "INPUT")
-        jump_removed = False
+        table       = iptc.Table(iptc.Table.FILTER)
+        input_chain = iptc.Chain(table, "INPUT")
+        removed_jump = False
         for rule in list(input_chain.rules):
             if rule.target and rule.target.name == CHAIN_NAME:
                 input_chain.delete_rule(rule)
-                jump_removed = True
+                removed_jump = True
 
-        if jump_removed:
-            print("[+] Removed jump rule from INPUT chain.")
+        if removed_jump:
+            _ok("Removed jump rule from INPUT chain.")
         else:
-            print("[!] No jump rule found in INPUT chain.")
+            _warn("No jump rule found in INPUT chain.")
 
-        # Flush and delete the DDOS chain
         if chain_exists(table):
             chain = iptc.Chain(table, CHAIN_NAME)
             chain.flush()
             table.delete_chain(chain)
-            print(f"[+] Chain {CHAIN_NAME} flushed and deleted.")
+            _ok(f"Chain {CHAIN_NAME} flushed and deleted.")
         else:
-            print(f"[!] Chain {CHAIN_NAME} does not exist.")
+            _warn(f"Chain {CHAIN_NAME} does not exist.")
 
     except Exception as e:
-        print(f"[!] Error: {e}")
+        _err(f"Error: {e}")
 
+    print(_box_bot())
+    print()
 
 def cmd_log() -> None:
     if not os.path.exists(LOG_FILE):
-        print(f"[!] Log file not found: {LOG_FILE}")
-        print("    Ensure the mitigator has been run at least once.")
+        print()
+        print(_box_top("LOG"))
+        _err(f"Log file not found: {LOG_FILE}")
+        print(_box_row("  Run the mitigator at least once to create it."))
+        print(_box_bot())
         return
-    print(f"[*] Tailing {LOG_FILE} (Ctrl+C to stop):\n")
+
+    print()
+    print(_box_top(f"LOG  ·  {LOG_FILE}"))
+    print(_box_row(f"  {C.GREY}Ctrl+C to stop{C.RESET}"))
+    print(_box_bot())
+    print()
     try:
         subprocess.run(["tail", "-f", "-n", "50", LOG_FILE])
     except KeyboardInterrupt:
-        print("\n[*] Done.")
+        print(f"\n  {C.GREEN}Done.{C.RESET}\n")
     except FileNotFoundError:
-        print("[!] 'tail' command not found. Run: sudo apt install coreutils")
-
+        _err("'tail' command not found.")
 
 def cmd_whitelist() -> None:
-    """Display the WHITELIST from ddos_mitigator.py config without importing Scapy."""
-    print(f"\n{'═'*50}")
-    print("  Current WHITELIST (from CONFIG)")
-    print(f"{'═'*50}")
+    print()
+    print(_box_top("WHITELIST"))
+
+    # Import CONFIG directly instead of parsing source text
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mitigator  = os.path.join(script_dir, "ddos_mitigator.py")
+
+    if not os.path.exists(mitigator):
+        _err("ddos_mitigator.py not found in the same directory.")
+        print(_box_bot())
+        return
+
     try:
-        # Parse the config file with basic text search to avoid Scapy import
-        script_dir  = os.path.dirname(os.path.abspath(__file__))
-        mitigator   = os.path.join(script_dir, "ddos_mitigator.py")
-        if not os.path.exists(mitigator):
-            print("[!] ddos_mitigator.py not found in the same directory.")
-            return
-
-        in_whitelist = False
-        entries      = []
-        with open(mitigator) as f:
-            for line in f:
-                if '"WHITELIST"' in line and "[" in line:
-                    in_whitelist = True
-                if in_whitelist:
-                    stripped = line.strip().strip('",')
-                    if stripped and not stripped.startswith("#") and stripped not in ('[', ']', '{', '}'):
-                        if stripped.startswith('"') or stripped.startswith("'"):
-                            entries.append(stripped.strip('\'"'))
-                    if "]" in line:
-                        break
-
+        # Safely load only CONFIG from the mitigator module
+        import importlib.util
+        spec   = importlib.util.spec_from_file_location("_mitigator_cfg", mitigator)
+        mod    = importlib.util.module_from_spec(spec)
+        # Stub out heavy imports so we can read CONFIG without side effects
+        import unittest.mock as _mock
+        with _mock.patch.dict("sys.modules", {
+            "scapy":       _mock.MagicMock(),
+            "scapy.all":   _mock.MagicMock(),
+            "iptc":        _mock.MagicMock(),
+        }):
+            spec.loader.exec_module(mod)
+        entries = getattr(mod, "CONFIG", {}).get("WHITELIST", [])
         if entries:
             for e in entries:
-                print(f"  • {e}")
+                print(_box_row(f"  {C.GREEN}•{C.RESET}  {e}"))
         else:
-            print("  (empty or could not parse)")
+            print(_box_row(f"  {C.YELLOW}(empty){C.RESET}"))
     except Exception as e:
-        print(f"[!] Could not read whitelist: {e}")
+        _err(f"Could not load whitelist: {e}")
+
+    print(_box_bot())
     print()
 
-
-def usage() -> None:
-    print(__doc__)
-
+def cmd_help() -> None:
+    print()
+    print(_box_top("HELP"))
+    cmds = [
+        ("status",        "Show all currently blocked IPs"),
+        ("unblock <ip>",  "Remove iptables block for an IP"),
+        ("flush",         "Remove ALL rules and chains"),
+        ("log",           "Tail the log in real time"),
+        ("whitelist",     "Print current whitelist"),
+        ("help",          "Show this help message"),
+    ]
+    for cmd, desc in cmds:
+        print(_box_row(f"  {C.CYAN}{cmd:<18}{C.RESET}  {desc}"))
+    print(_box_sep())
+    print(_box_row(f"  {C.GREY}Usage: sudo python3 manage.py <command>{C.RESET}"))
+    print(_box_bot())
+    print()
 
 # ──────────────────────────────────────────────────────────
 #  ENTRY POINT
@@ -223,39 +320,36 @@ def usage() -> None:
 
 def main() -> None:
     check_root()
+    print_manage_banner()
 
     if len(sys.argv) < 2:
-        usage()
+        cmd_help()
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
 
     if cmd == "status":
         cmd_status()
-
     elif cmd == "unblock":
         if len(sys.argv) < 3:
-            print("[!] Usage: sudo python3 manage.py unblock <ip>")
+            _err(f"Usage: {C.WHITE}sudo python3 manage.py unblock <ip>{C.RESET}")
             sys.exit(1)
         cmd_unblock(sys.argv[2])
-
     elif cmd == "flush":
         cmd_flush()
-
     elif cmd == "log":
         cmd_log()
-
     elif cmd == "whitelist":
         cmd_whitelist()
-
     elif cmd in ("help", "--help", "-h"):
-        usage()
-
+        cmd_help()
     else:
-        print(f"[!] Unknown command: '{cmd}'")
-        usage()
+        print()
+        print(_box_top("UNKNOWN COMMAND"))
+        _err(f"'{cmd}' is not a valid command.")
+        print(_box_bot())
+        cmd_help()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
