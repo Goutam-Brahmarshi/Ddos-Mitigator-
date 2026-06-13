@@ -2,26 +2,9 @@
 """
 =============================================================
   DDoS Mitigation Tool with Built-in IDS/IPS
-  Author: Blue Team Final Year Project
+  Author: Goutam
   Purpose: EDUCATIONAL USE ONLY - Cybersecurity Research
-  Platform: Ubuntu Linux
-=============================================================
-  WARNING: This tool is intended solely for educational
-  purposes in controlled lab environments. Do NOT use
-  against systems you do not own or have explicit
-  written permission to test.
-=============================================================
-
-  Fixes & Improvements (v2):
-  - BUG FIX: iptables rules now properly cleaned on block expiry
-  - BUG FIX: Race condition in block logic eliminated (atomic lock)
-  - BUG FIX: Duplicate iptables rules prevented
-  - FEATURE: CIDR/subnet whitelist support (uses built-in ipaddress)
-  - FEATURE: Global rate limiter for spoofed/distributed floods
-  - FEATURE: DEBUG logging level for packet-level trace
-  - FEATURE: Auto-unblock background thread
-  - IMPROVEMENT: dashboard_loop hardened against exceptions
-  - IMPROVEMENT: Config validated at startup
+  Platform: Ubuntu Server 26.04
 =============================================================
 """
 
@@ -35,17 +18,184 @@ import ipaddress
 from datetime import datetime
 from collections import defaultdict, deque
 
-# ── Dependency checks from scappy──────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+#  TERMINAL UI  — Colors, glyphs, box-drawing
+# ──────────────────────────────────────────────────────────
+
+class C:
+    # Foreground colors
+    RED      = '\033[91m'
+    ORANGE   = '\033[38;5;208m'
+    YELLOW   = '\033[93m'
+    GREEN    = '\033[92m'
+    CYAN     = '\033[96m'
+    BLUE     = '\033[94m'
+    MAGENTA  = '\033[95m'
+    WHITE    = '\033[97m'
+    GREY     = '\033[90m'
+    # Styles
+    BOLD     = '\033[1m'
+    DIM      = '\033[2m'
+    RESET    = '\033[0m'
+
+# Keep a Colors alias so existing references still work
+Colors = C
+
+# Width of all UI panels
+UI_W = 70
+
+def _box_top(title: str = "", w: int = UI_W) -> str:
+    if title:
+        pad   = w - len(title) - 4
+        left  = pad // 2
+        right = pad - left
+        return f"{C.GREY}╔{'═'*left} {C.WHITE}{C.BOLD}{title}{C.RESET}{C.GREY} {'═'*right}╗{C.RESET}"
+    return f"{C.GREY}╔{'═'*(w-2)}╗{C.RESET}"
+
+def _box_bot(w: int = UI_W) -> str:
+    return f"{C.GREY}╚{'═'*(w-2)}╝{C.RESET}"
+
+def _box_sep(w: int = UI_W) -> str:
+    return f"{C.GREY}╠{'═'*(w-2)}╣{C.RESET}"
+
+def _box_row(content: str, w: int = UI_W) -> str:
+    # Strip ANSI for length calculation
+    import re
+    plain = re.sub(r'\033\[[^m]*m', '', content)
+    pad   = w - 2 - len(plain)
+    return f"{C.GREY}║{C.RESET} {content}{' '*max(0,pad-1)}{C.GREY}║{C.RESET}"
+
+def _box_blank(w: int = UI_W) -> str:
+    return f"{C.GREY}║{' '*(w-2)}║{C.RESET}"
+
+def print_banner() -> None:
+    art = rf"""
+{C.RED}{C.BOLD}INITIALIZING MITIGATION{C.RESET}"""
+    print(art)
+    print(_box_top("IDS / IPS ENGINE  v2"))
+    print(_box_row(f"{C.GREY}  Author & Scode  {C.RESET}       Goutam Achary                             "))
+    print(_box_row(f"{C.GREY}  Purpose {C.RESET}{C.YELLOW}LAB USE ONLY{C.RESET} — Security Research  "))
+    print(_box_row(f"{C.GREY}  Platform{C.RESET}               Ubuntu Server 26.04                       "))
+    print(_box_bot())
+    print()
+
+def print_config_summary(iface: str) -> None:
+    print(_box_top("CONFIGURATION"))
+    print(_box_row(f"  {C.CYAN}Interface{C.RESET}          {C.WHITE}{iface}{C.RESET}"))
+    print(_box_row(f"  {C.CYAN}IPS Mode{C.RESET}           {C.GREEN+'ACTIVE  ✔' if CONFIG['IPS_ENABLED'] else C.YELLOW+'IDS ONLY ✘'}{C.RESET}"))
+    print(_box_row(f"  {C.CYAN}Block Duration{C.RESET}     {'permanent' if CONFIG['BLOCK_DURATION']==-1 else str(CONFIG['BLOCK_DURATION'])+'s'}"))
+    print(_box_sep())
+    print(_box_row(f"  {C.GREY}THRESHOLDS (packets/sec){C.RESET}"))
+    print(_box_row(f"  {'SYN':<10} {C.RED}{CONFIG['SYN_FLOOD_THRESHOLD']:<6}{C.RESET}  "
+                   f"{'UDP':<10} {C.ORANGE}{CONFIG['UDP_FLOOD_THRESHOLD']:<6}{C.RESET}  "
+                   f"{'ICMP':<10} {C.YELLOW}{CONFIG['ICMP_FLOOD_THRESHOLD']}{C.RESET}"))
+    print(_box_row(f"  {'GENERAL':<10} {C.CYAN}{CONFIG['GENERAL_PKT_THRESHOLD']:<6}{C.RESET}  "
+                   f"{'GLOBAL':<10} {C.MAGENTA}{CONFIG['GLOBAL_PKT_THRESHOLD']:<6}{C.RESET}  "
+                   f"{'ALERT→BLK':<10} {C.WHITE}{CONFIG['IPS_BLOCK_THRESHOLD']}{C.RESET}"))
+    print(_box_bot())
+    print()
+
+# ── "Bananas !" ASCII art — printed on successful block ───
+
+BANANAS_ART = rf"""
+{C.YELLOW}{C.BOLD}
+  ██████╗  █████╗ ███╗   ██╗ █████╗ ███╗   ██╗ █████╗ ███████╗    ██╗
+  ██╔══██╗██╔══██╗████╗  ██║██╔══██╗████╗  ██║██╔══██╗██╔════╝    ██║
+  ██████╔╝███████║██╔██╗ ██║███████║██╔██╗ ██║███████║███████╗    ██║
+  ██╔══██╗██╔══██║██║╚██╗██║██╔══██║██║╚██╗██║██╔══██║╚════██║    ╚═╝
+  ██████╔╝██║  ██║██║ ╚████║██║  ██║██║ ╚████║██║  ██║███████║    ██╗
+  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚══════╝    ╚═╝
+{C.RESET}"""
+
+def print_block_event(ip: str, alert_count: int) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(BANANAS_ART)
+    print(_box_top("  ▶  IP BLOCKED  ◀"))
+    print(_box_blank())
+    print(_box_row(f"  {C.RED}{C.BOLD}  🚫  {ip:<22}{C.RESET}  dropped via iptables"))
+    print(_box_row(f"  {C.GREY}  Alerts triggered : {C.WHITE}{alert_count}{C.RESET}   "
+                   f"{C.GREY}Time : {C.WHITE}{ts}{C.RESET}"))
+    print(_box_blank())
+    print(_box_bot())
+    print()
+
+def print_ids_alert(ip: str, attack_type: str, rate: float, count: int) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    # Color-code by attack type
+    acolor = {
+        "SYN Flood":    C.RED,
+        "UDP Flood":    C.ORANGE,
+        "ICMP Flood":   C.YELLOW,
+        "Packet Flood": C.CYAN,
+    }.get(attack_type, C.RED)
+
+    badge = f"{acolor}{C.BOLD} {attack_type.upper()} {C.RESET}"
+    print(_box_top("IDS  ALERT"))
+    print(_box_row(f"  {badge}   {C.WHITE}{ip:<22}{C.RESET}  {C.GREY}{ts}{C.RESET}"))
+    print(_box_row(f"  {C.GREY}  Rate : {acolor}{rate:.1f} pkt/s{C.RESET}"
+                   f"   {C.GREY}Alerts : {C.WHITE}{count}{C.RESET}"
+                   f"   {C.GREY}Threshold : {C.WHITE}{CONFIG['IPS_BLOCK_THRESHOLD']}{C.RESET}"))
+    print(_box_bot())
+
+def print_distributed_alert(proto: str, rate: float, last_src: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(_box_top("⚠  DISTRIBUTED / SPOOFED FLOOD"))
+    print(_box_row(f"  {C.MAGENTA}{C.BOLD}  GLOBAL RATE EXCEEDED{C.RESET}"))
+    print(_box_row(f"  {C.GREY}  Proto : {C.WHITE}{proto:<6}{C.RESET}"
+                   f"  {C.GREY}Rate : {C.MAGENTA}{rate:.1f} pkt/s{C.RESET}"
+                   f"  {C.GREY}Last src : {C.WHITE}{last_src}{C.RESET}"
+                   f"  {C.GREY}{ts}{C.RESET}"))
+    print(_box_bot())
+
+def print_dashboard(snap: dict) -> None:
+    blocked = snap["blocked_ips"]
+    alerts  = snap["alert_counts"]
+    ts      = datetime.now().strftime("%H:%M:%S")
+
+    print()
+    print(_box_top(f"STATUS  {ts}"))
+    print(_box_row(f"  {C.GREY}Total packets{C.RESET}    {C.WHITE}{C.BOLD}{snap['total_packets']}{C.RESET}"))
+    print(_box_row(f"  {C.GREY}IPS mode{C.RESET}         "
+                   f"{'  '+C.GREEN+C.BOLD+'ACTIVE'+C.RESET if CONFIG['IPS_ENABLED'] else C.YELLOW+'IDS ONLY'+C.RESET}"))
+    print(_box_row(f"  {C.GREY}Blocked IPs{C.RESET}      {C.RED}{C.BOLD}{len(blocked)}{C.RESET}"))
+    if blocked:
+        print(_box_sep())
+        print(_box_row(f"  {C.BOLD}{'IP':<20}  {'ALERTS':>6}  {'EXPIRES IN':>12}{C.RESET}"))
+        print(_box_row(f"  {C.GREY}{'─'*20}  {'──────':>6}  {'──────────':>12}{C.RESET}"))
+        for ip, ts_block in blocked.items():
+            elapsed   = int(time.time() - ts_block)
+            remaining = "permanent" if CONFIG["BLOCK_DURATION"] == -1 else \
+                        f"{max(0, CONFIG['BLOCK_DURATION'] - elapsed)}s"
+            alc = alerts.get(ip, 0)
+            print(_box_row(f"  {C.RED}{ip:<20}{C.RESET}  {C.WHITE}{alc:>6}{C.RESET}  {C.YELLOW}{remaining:>12}{C.RESET}"))
+    print(_box_bot())
+    print()
+
+def print_unblock_event(ip: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(_box_top("IP UNBLOCKED"))
+    print(_box_row(f"  {C.GREEN}✔  {ip:<22}{C.RESET}  block expired — rule removed  {C.GREY}{ts}{C.RESET}"))
+    print(_box_bot())
+    print()
+
+def print_shutdown() -> None:
+    print()
+    print(_box_top("SHUTDOWN"))
+    print(_box_row(f"  {C.YELLOW}Flushing iptables rules …{C.RESET}"))
+    print(_box_bot())
+    print()
+
+# ── Dependency checks ──────────────────────────────────────
 try:
     from scapy.all import sniff, IP, TCP, UDP, ICMP, get_if_list
 except ImportError:
-    print("[!] Scapy not found. Install with: sudo pip3 install scapy")
+    print(f"{C.RED}[!] Scapy not found. Install: sudo pip3 install scapy{C.RESET}")
     sys.exit(1)
 
 try:
     import iptc
-except ImportError:f
-    print("[!] python-iptables not found. Install with: sudo pip3 install python-iptables")
+except ImportError:
+    print(f"{C.RED}[!] python-iptables not found. Install: sudo pip3 install python-iptables{C.RESET}")
     sys.exit(1)
 
 # ──────────────────────────────────────────────────────────
@@ -53,46 +203,26 @@ except ImportError:f
 # ──────────────────────────────────────────────────────────
 
 CONFIG = {
-    # Per-source-IP thresholds (packets per second)
-    "SYN_FLOOD_THRESHOLD":    50,    # SYN packets/sec before flagging
-    "UDP_FLOOD_THRESHOLD":    100,   # UDP packets/sec before flagging
-    "ICMP_FLOOD_THRESHOLD":   20,    # ICMP packets/sec before flagging
-    "GENERAL_PKT_THRESHOLD":  200,   # Any other packet type /sec before flagging
-
-    # Global threshold — catches distributed/spoofed floods (--rand-source)
-    # where per-IP counts stay low but total traffic is massive
-    "GLOBAL_PKT_THRESHOLD":   5000,  # total pkt/s across ALL IPs
-
-    # Sliding window (seconds) for all rate calculations
+    "SYN_FLOOD_THRESHOLD":    10,
+    "UDP_FLOOD_THRESHOLD":    50,
+    "ICMP_FLOOD_THRESHOLD":   5,
+    "GENERAL_PKT_THRESHOLD":  200,
+    "GLOBAL_PKT_THRESHOLD":   1000,
     "RATE_WINDOW":            5,
-
-    # Auto-block after this many IDS alerts from one IP
-    "IPS_BLOCK_THRESHOLD":    3,
-
-    # How long (seconds) to keep an IP blocked.  -1 = permanent until manual flush.
-    "BLOCK_DURATION":         300,
-
-    # Whitelist — these IPs/CIDRs are NEVER blocked.
-    # Supports exact IPs ("192.168.1.1") and CIDR ranges ("10.0.0.0/8").
-    # Add your gateway, management IPs, etc. here.
+    "IPS_BLOCK_THRESHOLD":    2,
+    "BLOCK_DURATION":         60,
     "WHITELIST": [
         "127.0.0.1",
         "::1",
+        "192.168.179.133",
+        "192.168.179.1",
+        "192.168.179.2",
+        "192.168.56.1",
     ],
-
-    # Network interface to sniff on.  None = auto-select first non-loopback.
-    "INTERFACE": None,
-
-    # Log file path
+    "INTERFACE": "ens34",
     "LOG_FILE": "/var/log/ddos_mitigator.log",
-
-    # IPS mode: False = IDS only (alerts, no iptables changes)
     "IPS_ENABLED": True,
-
-    # Set to logging.DEBUG to see every classified packet
     "LOG_LEVEL": logging.INFO,
-
-    # How often (seconds) the auto-unblock thread wakes to check expired blocks
     "UNBLOCK_CHECK_INTERVAL": 30,
 }
 
@@ -100,8 +230,7 @@ CONFIG = {
 #  CONFIG VALIDATION
 # ──────────────────────────────────────────────────────────
 
-def validate_config():
-    """Catch obvious mis-configurations before we start sniffing."""
+def validate_config() -> None:
     errors = []
     for key in ("SYN_FLOOD_THRESHOLD", "UDP_FLOOD_THRESHOLD",
                 "ICMP_FLOOD_THRESHOLD", "GENERAL_PKT_THRESHOLD",
@@ -111,12 +240,10 @@ def validate_config():
 
     if CONFIG["RATE_WINDOW"] <= 0:
         errors.append(f"  RATE_WINDOW must be > 0 (got {CONFIG['RATE_WINDOW']})")
-
     if CONFIG["IPS_BLOCK_THRESHOLD"] <= 0:
-        errors.append(f"  IPS_BLOCK_THRESHOLD must be > 0")
-
+        errors.append("  IPS_BLOCK_THRESHOLD must be > 0")
     if CONFIG["BLOCK_DURATION"] != -1 and CONFIG["BLOCK_DURATION"] <= 0:
-        errors.append(f"  BLOCK_DURATION must be > 0 or -1 for permanent")
+        errors.append("  BLOCK_DURATION must be > 0 or -1 for permanent")
 
     for entry in CONFIG["WHITELIST"]:
         try:
@@ -125,35 +252,50 @@ def validate_config():
             errors.append(f"  Invalid WHITELIST entry: '{entry}'")
 
     if errors:
-        print("[!] Configuration errors found:")
+        print(_box_top("CONFIG ERRORS"))
         for e in errors:
-            print(e)
+            print(_box_row(f"  {C.RED}{e}{C.RESET}"))
+        print(_box_bot())
         sys.exit(1)
 
 # ──────────────────────────────────────────────────────────
-#  LOGGING SETUP
+#  LOGGING — ANSI stripped for file handler
 # ──────────────────────────────────────────────────────────
 
-def setup_logging():
-    log_format = "%(asctime)s [%(levelname)s] %(message)s"
-    handlers = [logging.StreamHandler(sys.stdout)]
+import re as _re
+
+class _StripAnsiFormatter(logging.Formatter):
+    _ansi = _re.compile(r'\033\[[^m]*m')
+    def format(self, record: logging.LogRecord) -> str:
+        record.msg  = self._ansi.sub('', str(record.msg))
+        record.args = None
+        return super().format(record)
+
+def setup_logging() -> None:
+    log_format = "%(asctime)s [%(levelname)-8s] %(message)s"
+    console_h  = logging.StreamHandler(sys.stdout)
+    console_h.setFormatter(logging.Formatter(log_format))
+    handlers: list[logging.Handler] = [console_h]
     try:
-        handlers.append(logging.FileHandler(CONFIG["LOG_FILE"]))
+        file_h = logging.FileHandler(CONFIG["LOG_FILE"])
+        file_h.setFormatter(_StripAnsiFormatter(log_format))
+        handlers.append(file_h)
     except PermissionError:
-        print(f"[!] Cannot write to {CONFIG['LOG_FILE']} — logging to console only.")
-    logging.basicConfig(level=CONFIG["LOG_LEVEL"], format=log_format, handlers=handlers)
+        print(f"{C.YELLOW}[!] Cannot write to {CONFIG['LOG_FILE']} — console only.{C.RESET}")
+    root = logging.getLogger()
+    root.setLevel(CONFIG["LOG_LEVEL"])
+    for h in handlers:
+        root.addHandler(h)
 
 logger = logging.getLogger("DDoS-Mitigator")
 
 # ──────────────────────────────────────────────────────────
-#  WHITELIST HELPER
+#  WHITELIST
 # ──────────────────────────────────────────────────────────
 
-# Pre-parsed whitelist entries for fast matching
 _WHITELIST_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 
-def build_whitelist():
-    """Parse CONFIG["WHITELIST"] once into ipaddress network objects."""
+def build_whitelist() -> None:
     for entry in CONFIG["WHITELIST"]:
         try:
             _WHITELIST_NETWORKS.append(ipaddress.ip_network(entry, strict=False))
@@ -161,7 +303,6 @@ def build_whitelist():
             logger.warning(f"[CFG] Skipping invalid whitelist entry: '{entry}'")
 
 def is_whitelisted(ip: str) -> bool:
-    """Return True if ip matches any whitelist entry (exact IP or CIDR)."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -173,22 +314,13 @@ def is_whitelisted(ip: str) -> bool:
 # ──────────────────────────────────────────────────────────
 
 class TrafficStats:
-    """Thread-safe per-IP traffic counters using sliding time windows."""
-
     def __init__(self, window: int):
         self.window = window
-        self._lock = threading.Lock()
-
-        # {ip: {proto: deque of float timestamps}}
-        self._timestamps: dict[str, dict[str, deque]] = defaultdict(
-            lambda: defaultdict(deque)
-        )
-
+        self._lock   = threading.Lock()
+        self._timestamps: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(deque))
         self.total_packets: int = 0
-        self.blocked_ips: dict[str, float] = {}    # ip -> block_start_time
-        self.alert_counts: dict[str, int] = defaultdict(int)  # ip -> alert count
-
-    # ── recording ──────────────────────────────────────────
+        self.blocked_ips:   dict[str, float] = {}
+        self.alert_counts:  dict[str, int]   = defaultdict(int)
 
     def record(self, ip: str, proto: str) -> None:
         now = time.time()
@@ -198,8 +330,6 @@ class TrafficStats:
             dq.append(now)
             self._prune(dq, now)
 
-    # ── rate calculation ───────────────────────────────────
-
     def rate(self, ip: str, proto: str) -> float:
         now = time.time()
         with self._lock:
@@ -208,44 +338,29 @@ class TrafficStats:
             return len(dq) / self.window
 
     def _prune(self, dq: deque, now: float) -> None:
-        """Remove timestamps older than the sliding window (caller holds lock)."""
         cutoff = now - self.window
         while dq and dq[0] < cutoff:
             dq.popleft()
 
-    # ── block management ───────────────────────────────────
-
+    # ── read-only check — does NOT mutate state ────────────
     def is_blocked(self, ip: str) -> bool:
-        """Check if IP is currently blocked; auto-expire timed-out blocks."""
         with self._lock:
-            return self._check_blocked_locked(ip)
-
-    def _check_blocked_locked(self, ip: str) -> bool:
-        """Must be called with self._lock held."""
-        if ip not in self.blocked_ips:
-            return False
-        if CONFIG["BLOCK_DURATION"] == -1:
-            return True
-        elapsed = time.time() - self.blocked_ips[ip]
-        if elapsed > CONFIG["BLOCK_DURATION"]:
-            # Expired — remove from internal state.
-            # The caller is responsible for removing the iptables rule.
-            del self.blocked_ips[ip]
-            return False
-        return True
+            if ip not in self.blocked_ips:
+                return False
+            if CONFIG["BLOCK_DURATION"] == -1:
+                return True
+            return (time.time() - self.blocked_ips[ip]) <= CONFIG["BLOCK_DURATION"]
 
     def try_block_ip(self, ip: str) -> bool:
-        """
-        Atomically check-and-set the block flag.
-        Returns True if THIS call is the one that set the block
-        (caller should then add the iptables rule).
-        Returns False if ip was already blocked (no-op).
-        """
+        """Attempt to record a new block. Returns True if newly blocked."""
         with self._lock:
-            if self._check_blocked_locked(ip):
-                return False          # Already blocked — do nothing
+            if ip in self.blocked_ips:
+                if CONFIG["BLOCK_DURATION"] == -1:
+                    return False
+                if (time.time() - self.blocked_ips[ip]) <= CONFIG["BLOCK_DURATION"]:
+                    return False
             self.blocked_ips[ip] = time.time()
-            return True               # We set it — caller must add iptables rule
+            return True
 
     def unblock_ip(self, ip: str) -> None:
         with self._lock:
@@ -253,14 +368,11 @@ class TrafficStats:
             self.alert_counts.pop(ip, None)
 
     def get_expired_blocks(self) -> list[str]:
-        """
-        Return list of IPs whose block duration has elapsed.
-        Removes them from blocked_ips in one pass (caller cleans iptables).
-        """
-        now = time.time()
-        expired = []
+        """Collect and remove expired blocks (called only from auto_unblock_loop)."""
         if CONFIG["BLOCK_DURATION"] == -1:
-            return expired
+            return []
+        now     = time.time()
+        expired = []
         with self._lock:
             for ip, start in list(self.blocked_ips.items()):
                 if now - start > CONFIG["BLOCK_DURATION"]:
@@ -269,14 +381,10 @@ class TrafficStats:
                     self.alert_counts.pop(ip, None)
         return expired
 
-    # ── alert counting ─────────────────────────────────────
-
     def increment_alert(self, ip: str) -> int:
         with self._lock:
             self.alert_counts[ip] += 1
             return self.alert_counts[ip]
-
-    # ── snapshot for dashboard ─────────────────────────────
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -285,7 +393,6 @@ class TrafficStats:
                 "blocked_ips":   dict(self.blocked_ips),
                 "alert_counts":  dict(self.alert_counts),
             }
-
 
 stats = TrafficStats(CONFIG["RATE_WINDOW"])
 
@@ -296,19 +403,15 @@ stats = TrafficStats(CONFIG["RATE_WINDOW"])
 CHAIN_NAME = "DDOS_MITIGATOR"
 
 def iptables_setup() -> None:
-    """Create a dedicated iptables chain and jump to it from INPUT."""
     try:
         table = iptc.Table(iptc.Table.FILTER)
-        chain_names = [c.name for c in table.chains]
-        if CHAIN_NAME not in chain_names:
+        if CHAIN_NAME not in [c.name for c in table.chains]:
             table.create_chain(CHAIN_NAME)
             logger.info(f"[IPS] Created iptables chain: {CHAIN_NAME}")
 
-        # Insert jump at the top of INPUT (idempotent)
         input_chain = iptc.Chain(table, "INPUT")
-        for rule in input_chain.rules:
-            if rule.target and rule.target.name == CHAIN_NAME:
-                return   # Already present — nothing to do
+        if any(r.target and r.target.name == CHAIN_NAME for r in input_chain.rules):
+            return
         rule = iptc.Rule()
         rule.target = iptc.Target(rule, CHAIN_NAME)
         input_chain.insert_rule(rule)
@@ -317,51 +420,41 @@ def iptables_setup() -> None:
         logger.error(f"[IPS] iptables setup failed: {e}")
 
 def iptables_block(ip: str) -> None:
-    """Add a DROP rule for the given IP in our chain (idempotent)."""
     try:
         table = iptc.Table(iptc.Table.FILTER)
         chain = iptc.Chain(table, CHAIN_NAME)
-
-        # Prevent duplicate rules (check before inserting)
         for rule in chain.rules:
             if rule.src in (ip, ip + "/255.255.255.255"):
-                logger.debug(f"[IPS] Rule for {ip} already present — skipping insert.")
+                logger.debug(f"[IPS] Rule for {ip} already present.")
                 return
-
         rule = iptc.Rule()
-        rule.src = ip
+        rule.src    = ip
         rule.target = iptc.Target(rule, "DROP")
         chain.insert_rule(rule)
-        logger.warning(f"[IPS] ⛔  BLOCKED  {ip}  via iptables")
+        logger.info(f"[IPS] BLOCKED {ip} via iptables")
     except Exception as e:
         logger.error(f"[IPS] Failed to block {ip}: {e}")
 
 def iptables_unblock(ip: str) -> None:
-    """Remove the DROP rule for the given IP from our chain."""
     try:
         table = iptc.Table(iptc.Table.FILTER)
         chain = iptc.Chain(table, CHAIN_NAME)
         for rule in list(chain.rules):
             if rule.src in (ip, ip + "/255.255.255.255"):
                 chain.delete_rule(rule)
-                logger.info(f"[IPS] ✅  UNBLOCKED  {ip}")
+                logger.info(f"[IPS] UNBLOCKED {ip}")
                 return
-        logger.debug(f"[IPS] No iptables rule found for {ip} — nothing to remove.")
+        logger.debug(f"[IPS] No iptables rule found for {ip}.")
     except Exception as e:
         logger.error(f"[IPS] Failed to unblock {ip}: {e}")
 
 def iptables_flush() -> None:
-    """Remove all our rules and delete the chain cleanly."""
     try:
-        table = iptc.Table(iptc.Table.FILTER)
-
-        # Remove jump from INPUT
+        table       = iptc.Table(iptc.Table.FILTER)
         input_chain = iptc.Chain(table, "INPUT")
         for rule in list(input_chain.rules):
             if rule.target and rule.target.name == CHAIN_NAME:
                 input_chain.delete_rule(rule)
-
-        # Flush and delete our chain
         if CHAIN_NAME in [c.name for c in table.chains]:
             chain = iptc.Chain(table, CHAIN_NAME)
             chain.flush()
@@ -375,39 +468,31 @@ def iptables_flush() -> None:
 # ──────────────────────────────────────────────────────────
 
 def ids_alert(ip: str, attack_type: str, rate: float) -> None:
-    """Log an IDS alert and — if IPS is enabled — atomically trigger a block."""
-    msg = (f"[IDS] 🚨 ALERT | src={ip} | type={attack_type} "
-           f"| rate={rate:.1f} pkt/s")
-    logger.warning(msg)
+    count = stats.increment_alert(ip)
+    # Rich visual alert (console only — logger strips ANSI for file)
+    print_ids_alert(ip, attack_type, rate, count)
+    logger.warning(f"[IDS] ALERT src={ip} type={attack_type} rate={rate:.1f} pkt/s alerts={count}")
 
     if not CONFIG["IPS_ENABLED"]:
         return
 
-    count = stats.increment_alert(ip)
     if count >= CONFIG["IPS_BLOCK_THRESHOLD"]:
-        # try_block_ip is atomic: only the first caller proceeds to iptables.
         if stats.try_block_ip(ip):
             iptables_block(ip)
-
+            print_block_event(ip, count)   # "Bananas !" moment
 
 def inspect_packet(pkt) -> None:
-    """Scapy packet callback — classify, record, and analyse each packet."""
     if IP not in pkt:
         return
 
     src_ip = pkt[IP].src
 
-    # Skip whitelisted sources
     if is_whitelisted(src_ip):
         return
-
-    # Skip already-blocked IPs (kernel drops them at the iptables level,
-    # but Scapy may briefly still capture them before the rule takes effect)
     if stats.is_blocked(src_ip):
         return
 
-    # ── Protocol classification ──────────────────────────
-    if TCP in pkt and pkt[TCP].flags & 0x02:   # SYN flag set
+    if TCP in pkt and pkt[TCP].flags & 0x02:
         proto        = "SYN"
         threshold    = CONFIG["SYN_FLOOD_THRESHOLD"]
         attack_label = "SYN Flood"
@@ -424,92 +509,58 @@ def inspect_packet(pkt) -> None:
         threshold    = CONFIG["GENERAL_PKT_THRESHOLD"]
         attack_label = "Packet Flood"
 
-    # Record this packet for per-IP and global counters
-    stats.record(src_ip, proto)
+    stats.record(src_ip,       proto)
     stats.record("__global__", proto)
 
-    # ── Per-IP rate check ────────────────────────────────
     per_ip_rate = stats.rate(src_ip, proto)
     logger.debug(f"[PKT] src={src_ip} proto={proto} rate={per_ip_rate:.1f} pkt/s")
 
     if per_ip_rate >= threshold:
         ids_alert(src_ip, attack_label, per_ip_rate)
-        return   # Already alerted for this packet; skip global check
+        return
 
-    # ── Global rate check (catches distributed/spoofed floods) ──
     global_rate = stats.rate("__global__", proto)
     if global_rate >= CONFIG["GLOBAL_PKT_THRESHOLD"]:
+        print_distributed_alert(proto, global_rate, src_ip)
         logger.warning(
-            f"[IDS] 🌐 DISTRIBUTED/SPOOFED FLOOD DETECTED | "
-            f"proto={proto} | global_rate={global_rate:.1f} pkt/s | "
-            f"last_src={src_ip}"
+            f"[IDS] DISTRIBUTED FLOOD proto={proto} "
+            f"global_rate={global_rate:.1f} pkt/s last_src={src_ip}"
         )
 
 # ──────────────────────────────────────────────────────────
 #  AUTO-UNBLOCK THREAD
 # ──────────────────────────────────────────────────────────
 
-def auto_unblock_loop() -> None:
-    """
-    Periodically scan for blocks whose BLOCK_DURATION has expired and
-    remove both the internal state entry AND the iptables rule.
+_stop_event = threading.Event()
 
-    This fixes the original bug where is_blocked() removed the in-memory
-    entry on expiry but left the iptables DROP rule in place, meaning the
-    IP was silently blocked forever by the kernel even though the tool
-    considered it unblocked.
-    """
-    while True:
+def auto_unblock_loop() -> None:
+    while not _stop_event.wait(timeout=CONFIG["UNBLOCK_CHECK_INTERVAL"]):
         try:
-            time.sleep(CONFIG["UNBLOCK_CHECK_INTERVAL"])
             expired = stats.get_expired_blocks()
             for ip in expired:
-                logger.info(f"[IPS] ⏱  Block expired for {ip} — removing iptables rule.")
                 iptables_unblock(ip)
+                print_unblock_event(ip)
         except Exception as e:
             logger.error(f"[AutoUnblock] Unexpected error: {e}")
 
 # ──────────────────────────────────────────────────────────
-#  DASHBOARD — periodic status print
+#  DASHBOARD-THREAD
 # ──────────────────────────────────────────────────────────
 
 def dashboard_loop(interval: int = 10) -> None:
-    """Print a status summary every `interval` seconds."""
-    while True:
+    while not _stop_event.wait(timeout=interval):
         try:
-            time.sleep(interval)
-        except Exception:
-            break
-
-        try:
-            snap    = stats.snapshot()
-            blocked = snap["blocked_ips"]
-            alerts  = snap["alert_counts"]
-
-            print("\n" + "═" * 60)
-            print(f"  📊  DDoS Mitigator Status — {datetime.now().strftime('%H:%M:%S')}")
-            print(f"  Total packets seen : {snap['total_packets']}")
-            print(f"  IPS mode           : {'ON' if CONFIG['IPS_ENABLED'] else 'OFF (IDS only)'}")
-            print(f"  Currently blocked  : {len(blocked)} IP(s)")
-            if blocked:
-                for ip, ts in blocked.items():
-                    elapsed   = int(time.time() - ts)
-                    if CONFIG["BLOCK_DURATION"] == -1:
-                        remaining = "∞"
-                    else:
-                        remaining = max(0, CONFIG["BLOCK_DURATION"] - elapsed)
-                    print(f"    ⛔ {ip:<20} alerts={alerts.get(ip, 0)}  "
-                          f"unblocks in {remaining}s")
-            print("═" * 60 + "\n")
+            print_dashboard(stats.snapshot())
         except Exception as e:
             logger.error(f"[Dashboard] Unexpected error: {e}")
 
 # ──────────────────────────────────────────────────────────
-#  SIGNAL HANDLER — clean exit
+#  SIGNAL HANDLER
 # ──────────────────────────────────────────────────────────
 
 def handle_exit(sig, frame) -> None:
-    print("\n[*] Shutting down — cleaning iptables rules...")
+    print_shutdown()
+    _stop_event.set()
     iptables_flush()
     sys.exit(0)
 
@@ -534,62 +585,32 @@ def pick_interface() -> str:
 
 def main() -> None:
     if os.geteuid() != 0:
-        print("[!] This tool requires root privileges.")
-        print("    Run with: sudo python3 ddos_mitigator.py")
+        print(_box_top("PERMISSION ERROR"))
+        print(_box_row(f"  {C.RED}Root privileges required.{C.RESET}"))
+        print(_box_row(f"  Run: {C.WHITE}sudo python3 ddos_mitigator.py{C.RESET}"))
+        print(_box_bot())
         sys.exit(1)
 
     validate_config()
     setup_logging()
     build_whitelist()
 
-    print("""
-╔══════════════════════════════════════════════════════════╗
-║       DDoS Mitigation Tool — IDS/IPS Engine  v2          ║
-║       EDUCATIONAL USE ONLY | Blue Team Lab               ║
-╚══════════════════════════════════════════════════════════╝
-    """)
+    print_banner()
 
-    # Register clean-exit handlers for Ctrl+C and kill signals
     signal.signal(signal.SIGINT,  handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
-    # ── IPS setup ──────────────────────────────────────────
     if CONFIG["IPS_ENABLED"]:
         iptables_setup()
-        logger.info("[IPS] IPS mode is ACTIVE — attackers will be blocked via iptables.")
-    else:
-        logger.info("[IDS] Running in IDS-only mode — alerts only, no blocking.")
 
-    # ── Interface ──────────────────────────────────────────
     iface = pick_interface()
-    logger.info(f"[*] Sniffing on interface: {iface}")
-    logger.info(
-        f"[*] Per-IP thresholds: "
-        f"SYN={CONFIG['SYN_FLOOD_THRESHOLD']}/s  "
-        f"UDP={CONFIG['UDP_FLOOD_THRESHOLD']}/s  "
-        f"ICMP={CONFIG['ICMP_FLOOD_THRESHOLD']}/s"
-    )
-    logger.info(
-        f"[*] Global threshold:  {CONFIG['GLOBAL_PKT_THRESHOLD']}/s  "
-        f"(distributed/spoofed flood detection)"
-    )
-    logger.info(
-        f"[*] Block threshold:   {CONFIG['IPS_BLOCK_THRESHOLD']} alerts  "
-        f"| Duration: "
-        f"{'permanent' if CONFIG['BLOCK_DURATION'] == -1 else str(CONFIG['BLOCK_DURATION']) + 's'}"
-    )
-    logger.info("[*] Press Ctrl+C to stop.\n")
+    print_config_summary(iface)
 
-    # ── Background threads ─────────────────────────────────
-    threading.Thread(
-        target=dashboard_loop, args=(10,), daemon=True, name="Dashboard"
-    ).start()
+    logger.info(f"[*] Sniffing on {iface} — Press Ctrl+C to stop.")
 
-    threading.Thread(
-        target=auto_unblock_loop, daemon=True, name="AutoUnblock"
-    ).start()
+    threading.Thread(target=dashboard_loop,   args=(10,), daemon=True, name="Dashboard").start()
+    threading.Thread(target=auto_unblock_loop,            daemon=True, name="AutoUnblock").start()
 
-    # ── Start packet capture (blocking call) ───────────────
     sniff(iface=iface, prn=inspect_packet, store=False)
 
 
